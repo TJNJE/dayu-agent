@@ -8,12 +8,14 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Optional, Protocol, runtime_checkable
 from threading import Lock
 
+from dayu.log import Log
 from dayu.fins._converters import int_or_zero, optional_int
 from dayu.contracts.fins import (
     DownloadCommandPayload,
     DownloadCompanyInfo,
     DownloadFailedFile,
     DownloadFilingResultItem,
+    DownloadFilingResultStatus,
     DownloadFilterWindow,
     DownloadFilters,
     DownloadProgressPayload,
@@ -58,7 +60,8 @@ from dayu.fins.cli_support import (
     _validate_upload_material_args as validate_upload_material_args,
 )
 from dayu.fins.ingestion.process_events import ProcessEvent
-from dayu.fins.domain.document_models import CompanyMeta
+from dayu.fins.domain.document_models import CompanyMeta, FilingSummary
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion.factory import (
     IngestionServiceFactory,
     build_ingestion_manager_key,
@@ -84,6 +87,8 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.tools.service import FinsToolService
+
+_LOG_MODULE = "FINS.RUNTIME"
 
 
 @runtime_checkable
@@ -146,6 +151,18 @@ class FinsRuntimeProtocol(CompanyMetaProviderProtocol, Protocol):
 
     def get_ingestion_manager_key(self) -> str:
         """返回长事务 job 管理器 key。"""
+
+        ...
+
+    def list_source_filings(self, ticker: str) -> list[FilingSummary]:
+        """列出指定股票的已下载财报源文件摘要。
+
+        Args:
+            ticker: 股票代码。
+
+        Returns:
+            财报源文件摘要列表。
+        """
 
         ...
 
@@ -828,7 +845,7 @@ def _build_download_filing_result_item(payload: dict[str, Any]) -> DownloadFilin
 
     return DownloadFilingResultItem(
         document_id=str(payload.get("document_id", "")).strip(),
-        status=str(payload.get("status", "")).strip(),
+        status=DownloadFilingResultStatus.from_raw(str(payload.get("status", ""))),
         form_type=_optional_text(payload.get("form_type")),
         filing_date=_optional_text(payload.get("filing_date")),
         report_date=_optional_text(payload.get("report_date")),
@@ -1322,6 +1339,79 @@ class DefaultFinsRuntime(FinsRuntimeProtocol):
         """返回长事务 job 管理器 key。"""
 
         return build_ingestion_manager_key(workspace_root=self.workspace_root)
+
+    def list_source_filings(self, ticker: str) -> list[FilingSummary]:
+        """列出指定股票的已下载财报源文件摘要。
+
+        Args:
+            ticker: 股票代码。
+
+        Returns:
+            财报源文件摘要列表。
+
+        Raises:
+            OSError: 列举源文档 ID 或读取单文档数据时底层存储异常。
+            ValueError: 存储数据损坏或格式不合法时抛出。
+        """
+
+        result: list[FilingSummary] = []
+        try:
+            document_ids = self.source_repository.list_source_document_ids(ticker, SourceKind.FILING)
+        except (OSError, ValueError):
+            Log.error(
+                f"列出财报源文档 ID 失败: ticker={ticker}",
+                exc_info=True,
+                module=_LOG_MODULE,
+            )
+            raise
+
+        skipped_document_count = 0
+        for doc_id in document_ids:
+            try:
+                meta = self.source_repository.get_source_meta(ticker, doc_id, SourceKind.FILING)
+                fiscal_year_raw = meta.get("fiscal_year")
+                primary_file_name: Optional[str] = None
+                primary_file_path: Optional[str] = None
+                try:
+                    primary_source = self.source_repository.get_primary_source(
+                        ticker, doc_id, SourceKind.FILING
+                    )
+                    materialized_path = primary_source.materialize().resolve()
+                    primary_file_name = materialized_path.name or None
+                    primary_file_path = str(materialized_path)
+                except (OSError, ValueError):
+                    Log.warning(
+                        f"读取财报主文件失败，降级返回元信息: ticker={ticker}, document_id={doc_id}",
+                        module=_LOG_MODULE,
+                    )
+
+                result.append(FilingSummary(
+                    document_id=doc_id,
+                    form_type=meta.get("form_type"),
+                    filing_date=meta.get("filing_date"),
+                    report_date=meta.get("report_date"),
+                    fiscal_year=fiscal_year_raw if isinstance(fiscal_year_raw, int) else None,
+                    fiscal_period=meta.get("fiscal_period"),
+                    is_deleted=bool(meta.get("is_deleted", False)),
+                    primary_file_name=primary_file_name,
+                    primary_file_path=primary_file_path,
+                ))
+            except (OSError, ValueError):
+                skipped_document_count += 1
+                Log.warning(
+                    f"读取单条财报元信息失败，已跳过: ticker={ticker}, document_id={doc_id}",
+                    module=_LOG_MODULE,
+                )
+                continue
+
+        if skipped_document_count > 0:
+            Log.warning(
+                "财报列表存在降级结果: "
+                f"ticker={ticker}, total={len(document_ids)}, skipped={skipped_document_count}",
+                module=_LOG_MODULE,
+            )
+        result.sort(key=lambda x: x.filing_date or "", reverse=True)
+        return result
 
     def get_company_name(self, ticker: str) -> str:
         """返回公司名称。"""
