@@ -160,7 +160,7 @@ Fins 当前通过两个 toolset registrar 向 Agent 路径注入工具：
 - 财报读取 toolset 的限制配置由 registrar 自己从 `context.toolset_config.payload` 反解，不再由 Host 传专用 `fins_tool_limits`
 - registrar 反解 `context.toolset_config.payload` 中的数值限制时，必须走 `dayu.contracts.toolset_config` 的统一 coercion helper，不能直接对 `ToolsetConfigValue` 做裸 `int()`
 - 财报读取工具只接受预构建 `FinsToolService`
-- ingestion 工具只接受 `service_factory + manager_key`
+- ingestion 工具只接受 `service_factory + manager_key`；下载 job 工具按 ticker 归一化后的市场路由到同一 ingestion service factory，当前支持美股、A 股、港股，A 股/港股表单过滤使用 `FY/H1/Q1/Q2/Q3`
 - `Host` 不再从 `FinsRuntime` 拉总仓储对象，也不再持有 Agent 工具注入所需的 Fins runtime
 
 ### 4.2 Prompt Contributions
@@ -201,6 +201,20 @@ direct operation 当前由 `FinsRuntime` 和对应 pipeline 实现。
 - `dayu/fins/pipelines/sec_process_workflow.py` — process/process_filing/process_material 的单文档决策与批量工作流编排
 - `dayu/fins/pipelines/sec_upload_workflow.py` — upload_filing/upload_material 的事件编排、稳定上传身份、自动动作解析与单文档 overwrite reset 收口
 
+SEC download 未显式传 `start_date` 时，`LOOKBACK_YEARS_BY_FORM` 是默认窗口真源：`10-K`/`20-F` 回溯 5 年，`10-Q` 与季报型 `6-K` 回溯 2 年，`DEF 14A` 回溯 3 年，`8-K`、SC13 系列表单回溯 1 年；显式传 `start_date` 时所有目标 form 共用用户窗口。
+
+`CnPipeline` 当前承担 A 股 / 港股下载、CN/HK 上传与 CN/HK process。CN/HK 下载链路已按 downloader / workflow / storage commit 拆分：
+
+- `dayu/fins/downloaders/cninfo_downloader.py` — 巨潮 discovery 与 PDF 下载；不写 workspace、不依赖 pipeline/docling/storage。
+- `dayu/fins/downloaders/hkexnews_downloader.py` — 披露易 discovery 与 PDF 下载；解析 active/inactive stock list、`titleSearchServlet.do`、多代码 `STOCK_CODE` 与中英语言补位，同样不写 workspace、不依赖 pipeline/docling/storage。
+- `dayu/fins/pipelines/cn_download_workflow.py` — ticker 级 form/window 解析、company meta 写入、overwrite ticker 级清理、候选调度与 summary 聚合。
+- `dayu/fins/pipelines/cn_download_filing_workflow.py` — 单 filing 的 fast skip、PDF SHA skip、中断恢复、Docling 转换与 commit 阶段机。
+- `dayu/fins/pipelines/cn_download_rebuild.py` — `download --rebuild` 的本地重建路径，只消费已完成的 PDF + Docling JSON source 文档，不访问巨潮、披露易或 Docling。
+- `dayu/fins/pipelines/cn_download_source_upsert.py` — 完成态 source meta 写入真源；完成态必须同时满足 PDF 落盘、`_docling.json` 落盘、`ingest_complete=True`、`primary_document` 指向 `_docling.json`。
+- `dayu/fins/pipelines/cn_download_staging.py` — 仅通过 blob 仓储探测中间态 PDF / Docling JSON，不直接拼 workspace 路径。
+
+CN/HK download 的 source 写入顺序固定为：先通过 source 仓储创建或更新 meta，再通过 blob 仓储写 PDF / Docling JSON，最后通过 source 仓储提交 `file_entries`、`primary_document` 与完成态 meta；不得绕开 source 仓储直接刷新 manifest。`company_id` 使用 `ticker_to_company_id()` 生成的 workspace 稳定主体 ID，主源解析出的 `CNINFO:{orgId}` / `HKEX:{stockId}` 写入 `provider_company_id` 作为审计字段。`overwrite=True` 与 SEC 对齐，走 filing maintenance 仓储的 ticker 级 `clear_filing_documents(ticker)`，不会复用 staged 或完成态文件。A 股默认 discovery client 使用巨潮，港股默认 discovery client 使用披露易，二者通过同一 `CnReportDiscoveryClientProtocol` 接入 workflow；HK FY/H1 查询披露易“财务报表/ESG 信息”分类，HK Q1/Q3 查询“公告及通告 - 季度业绩”分类，查无仍会收口为 skipped。未显式传 `start_date` 时，CN/HK 年报只保留最近 5 个 fiscal_year，半年报/季报只保留 end 年和上一 fiscal_year；远端查询会覆盖最大披露日期窗口，workflow 再按财期业务规则过滤候选。
+
 当前 source fiscal 字段还需要守住一条稳定边界：source/download/rebuild/list 四条链路都不能仅凭 `report_date` 或 `filing_date` 编造 fiscal 事实。`6-K` 与 `6-K/A` 在没有同源 fiscal 证据时都不得再猜 `fiscal_year/fiscal_period`；`10-Q` 也不得在 `list_documents()` 阶段仅凭 `report_date` 推断季度；其他表单同样不得在消费侧把空的 `fiscal_year` 从日期回填出来。当前仅保留表单内生、且不依赖日期猜测的低风险回退，例如 `10-K/20-F -> FY`。`download --rebuild` 走同一套真源，并且会清理历史上遗留在 source meta / manifest 中的 6-K / 6-K/A 猜测值。这个修复只影响 fiscal 字段，不改变 6-K 现有的 `document_type` 返回语义。
 
 边界划分：
@@ -212,14 +226,14 @@ direct operation 当前由 `FinsRuntime` 和对应 pipeline 实现。
 ### 5.1 并发与宿主约束
 
 当前直接受 Host 约束的典型点：
-- `download` 走 `sec_download` lane，必须串行
+- `download` 复用 Host 既有业务 lane 机制：美股 / A 股 / 港股分别走 `sec_download` / `cn_download` / `hk_download`，互不占用对方的并发许可
 - 流式 direct operation 事件可以双写到 EventBus
 - 取消通过 `CancellationBridge` 收口在 Host，而不是散在 Fins 内部
 - direct operation 不得自己持有 `RunRegistry` 或 Host 内部桥接器；若需要及时响应取消，只能沿 `Service -> Runtime -> Pipeline` 透传窄 `cancel_checker`，并在已支持取消协作的阶段边界主动停机
 
 ### 5.2 direct operation 公共契约
 
-`download/upload/process` 这条 direct operation 链路当前按命令拆成独立载荷和结果类型：
+`download/upload/process` 这条 direct operation 链路当前按命令拆成独立载荷和结果类型。`DownloadSummary` 的公共字段为 `total/downloaded/skipped/failed/elapsed_ms/reused_downloads/converted`；SEC 当前不做 PDF 复用与 Docling 转换，后两项固定为 0，CN/HK 会据恢复与转换阶段填充。
 
 - `DownloadCommandPayload` / `DownloadResultData` / `DownloadProgressPayload`
 - `UploadFilingCommandPayload` / `UploadFilingResultData` / `UploadFilingProgressPayload`
@@ -452,12 +466,12 @@ python utils/retriage_active_6k_filings.py --base workspace --tickers ALC,ASM,NV
   - 港股 4 位补零（`0700`）；港交所新发 5 位代码原样保留（`89988`）；`exchange="HKEX"`、`market="HK"`。
   - 沪股 6 位裸码，首位 `6`（主板 / 科创板）；`exchange="SSE"`、`market="CN"`。
   - 深股 6 位裸码，首位 `0` / `3`（主板 / 创业板）；`exchange="SZSE"`、`market="CN"`。
-  - 美股保留原字母（`AAPL` / `BRK.B` / `BF.B`）；`exchange=None`、`market="US"`（当前不区分 NYSE/NASDAQ）。
+  - 美股保留字母，点号单字符类股分隔符统一为横杠（`AAPL` / `BRK.B -> BRK-B` / `BF.B -> BF-B`）；`AAPL.SW` 这类外部交易所后缀不归一为美股 canonical；`exchange=None`、`market="US"`（当前不区分 NYSE/NASDAQ）。
 - 使用规则：
   - CLI / service / 仓储 / downloader / pipeline / prompt contribution 一律调用该真源，不再在各自模块重造 normalize 实现。
   - `FinsToolService._resolve_canonical_ticker` 中真源识别失败时会回退到 `strip().upper()` 作为查询候选，保留"公司名当 ticker 传"的既有行为。
   - CLI `--ticker` CSV 中**每个 token 都走真源归一化**，再整体去重：首个归一化结果作为 canonical，其余作为显式 alias。业务动机是把同一公司的跨市场 ticker（如 `BABA,9988`）整体作为 alias 写入 meta，让工具查询无论传哪种变形都能命中。
-- `ticker_to_company_id` 当前直接返回 `ticker.canonical`，属"稳定契约、实现可演进"：保留该接口以便后续接入跨市场上市折叠、CIK、统一社会信用代码等更精细的公司主体映射。
+- `ticker_to_company_id` 当前返回 `canonical_exchange`（美股无交易所时使用 `canonical_market`，如 `AAPL_US`），属"稳定契约、实现可演进"：保留该接口以便后续接入跨市场上市折叠、CIK、统一社会信用代码等更精细的公司主体映射。
 
 ## 7. 内部分层
 

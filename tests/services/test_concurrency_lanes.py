@@ -6,11 +6,15 @@ from pathlib import Path
 
 import pytest
 
+from dayu.contracts.fins import DownloadCommandPayload, FinsCommand, FinsCommandName, ProcessCommandPayload
 from dayu.services.concurrency_lanes import (
+    LANE_CN_DOWNLOAD,
+    LANE_HK_DOWNLOAD,
     LANE_SEC_DOWNLOAD,
     LANE_WRITE_CHAPTER,
     SERVICE_DEFAULT_LANE_CONFIG,
     resolve_contract_concurrency_lane,
+    resolve_fins_command_concurrency_lane,
     resolve_hosted_run_concurrency_lane,
 )
 from dayu.services.internal.write_pipeline.enums import WriteSceneName
@@ -20,7 +24,12 @@ from dayu.services.internal.write_pipeline.enums import WriteSceneName
 def test_service_default_lane_config_contains_business_lanes_only() -> None:
     """验证 Service 默认 lane 只声明业务 lane，不出现 Host 自治 lane。"""
 
-    assert set(SERVICE_DEFAULT_LANE_CONFIG.keys()) == {LANE_WRITE_CHAPTER, LANE_SEC_DOWNLOAD}
+    assert set(SERVICE_DEFAULT_LANE_CONFIG.keys()) == {
+        LANE_WRITE_CHAPTER,
+        LANE_SEC_DOWNLOAD,
+        LANE_CN_DOWNLOAD,
+        LANE_HK_DOWNLOAD,
+    }
     assert all(value > 0 for value in SERVICE_DEFAULT_LANE_CONFIG.values())
 
 
@@ -50,9 +59,63 @@ def test_resolve_hosted_run_concurrency_lane_maps_known_operations() -> None:
     """HostedRunSpec 层 resolver 覆盖三条业务分支。"""
 
     assert resolve_hosted_run_concurrency_lane("write_pipeline") is None
-    assert resolve_hosted_run_concurrency_lane("fins_download") == LANE_SEC_DOWNLOAD
+    assert resolve_hosted_run_concurrency_lane("fins_download") is None
     assert resolve_hosted_run_concurrency_lane("fins_analyze") is None
     assert resolve_hosted_run_concurrency_lane("") is None
+
+
+@pytest.mark.unit
+def test_resolve_fins_command_concurrency_lane_keeps_sec_on_sec_download() -> None:
+    """SEC download 仍应使用外层 sec_download lane。"""
+
+    command = FinsCommand(
+        name=FinsCommandName.DOWNLOAD,
+        payload=DownloadCommandPayload(ticker="AAPL"),
+    )
+
+    assert resolve_fins_command_concurrency_lane(command) == LANE_SEC_DOWNLOAD
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("ticker", ["600519", "002353"])
+def test_resolve_fins_command_concurrency_lane_uses_cn_download_for_cn(
+    ticker: str,
+) -> None:
+    """CN download 应使用独立 cn_download lane。"""
+
+    command = FinsCommand(
+        name=FinsCommandName.DOWNLOAD,
+        payload=DownloadCommandPayload(ticker=ticker),
+    )
+
+    assert resolve_fins_command_concurrency_lane(command) == LANE_CN_DOWNLOAD
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("ticker", ["0700", "00700.HK"])
+def test_resolve_fins_command_concurrency_lane_uses_hk_download_for_hk(
+    ticker: str,
+) -> None:
+    """HK download 应使用独立 hk_download lane。"""
+
+    command = FinsCommand(
+        name=FinsCommandName.DOWNLOAD,
+        payload=DownloadCommandPayload(ticker=ticker),
+    )
+
+    assert resolve_fins_command_concurrency_lane(command) == LANE_HK_DOWNLOAD
+
+
+@pytest.mark.unit
+def test_resolve_fins_command_concurrency_lane_returns_none_for_non_download() -> None:
+    """非 download 财报命令不声明下载业务 lane。"""
+
+    command = FinsCommand(
+        name=FinsCommandName.PROCESS,
+        payload=ProcessCommandPayload(ticker="AAPL"),
+    )
+
+    assert resolve_fins_command_concurrency_lane(command) is None
 
 
 @pytest.mark.unit

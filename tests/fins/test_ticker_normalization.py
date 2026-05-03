@@ -132,8 +132,11 @@ def test_sz_variants(raw: str, canonical: str) -> None:
         ("AAPL.PK", "AAPL"),
         ("NASDAQ.AAPL", "AAPL"),
         ("NYSE.BRK", "BRK"),
-        ("BRK.B", "BRK.B"),
-        ("BF.B", "BF.B"),
+        ("BRK.B", "BRK-B"),
+        ("BRK-A", "BRK-A"),
+        ("BRK.A", "BRK-A"),
+        ("BF.B", "BF-B"),
+        ("BF-B", "BF-B"),
         ("SHEL", "SHEL"),
         ("SHOP", "SHOP"),
     ],
@@ -159,6 +162,7 @@ def test_us_variants(raw: str, canonical: str) -> None:
         "123456789",
         "199999",  # 6 位但首位非 0/3/6
         "700.UN",  # 未知后缀
+        "AAPL.SW",  # 外部交易所后缀，不是美股类股分隔符
         "!!!",
         "A" * 9,  # 超过 US 长度上限
     ],
@@ -189,12 +193,16 @@ def test_try_normalize_failure_returns_none() -> None:
 # ---------- ticker_to_company_id ----------
 
 
-def test_ticker_to_company_id_returns_canonical() -> None:
-    """当前实现：公司 ID 即 canonical。"""
+def test_ticker_to_company_id_returns_canonical_with_exchange_suffix() -> None:
+    """公司 ID 由 canonical ticker 与交易所/市场后缀组成。"""
+
     ticker = NormalizedTicker(
         canonical="AAPL", market="US", exchange=None, raw="AAPL.US"
     )
-    assert ticker_to_company_id(ticker) == "AAPL"
+    assert ticker_to_company_id(ticker) == "AAPL_US"
+    assert ticker_to_company_id(normalize_ticker("600519.SH")) == "600519_SSE"
+    assert ticker_to_company_id(normalize_ticker("000333.SZ")) == "000333_SZSE"
+    assert ticker_to_company_id(normalize_ticker("0700.HK")) == "0700_HKEX"
 
 
 # ---------- 回退路径 ----------

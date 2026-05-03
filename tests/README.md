@@ -22,6 +22,11 @@
   - Fins direct operation、窄仓储、processor、tool service 测试
   - `tests/integration/fins/test_fins_tools_ground_truth.py` 依赖仓库内 `workspace/` 的真实 source 文档样本与 `tests/fixtures/fins/ground_truth/` 基线；当 CI 或干净环境里缺少这批本地样本时，应显式 `skip`，不能把“样本未准备”误报成产品回归
   - `tests/fins/test_sec_pipeline_helpers.py` 与 `tests/fins/test_sec_rebuild_workflow.py` 共同守住 source fiscal 真源边界：download/source 层禁止从 `report_date`/`filing_date` 硬猜 fiscal 字段，尤其是 6-K / 6-K/A 不得猜 `fiscal_year/fiscal_period`，rebuild 在新推断为空时也不得继续沿用 previous_meta 中的旧猜测值
+  - `tests/fins/test_cninfo_downloader.py` 负责守住巨潮 discovery 的网络隔离与候选去重边界：测试必须通过 `httpx.MockTransport` 注入全市场 `szse_stock.json` 与 `hisAnnouncement/query` fixture，不访问真实巨潮；公司解析 fixture 必须覆盖深市、沪市与全文搜索噪声不影响精确 ticker 解析；候选 fixture 必须覆盖 `secCode` 与 `adjunctType=PDF` 过滤；报告去重键必须是 `(fiscal_year, fiscal_period)`，同一年同 period 才按更正版优先、披露日期最新选择，不能把不同 fiscal_year 的年报互相吞掉
+  - `tests/fins/test_hkexnews_downloader.py` 负责守住披露易 discovery 的网络隔离与 HK 解析边界：测试必须通过 `httpx.MockTransport` 注入 fixture，不访问真实披露易；`0700/00700/700.HK` 要收敛到 5 位 `STOCK_CODE`，副语言只在主语言无候选时补位，Q1/Q3 空结果不得抛异常
+  - `tests/fins/test_cn_download_workflow.py` 负责守住 CN/HK 下载 workflow 的仓储顺序与恢复语义：fake downloader 不写 workspace，PDF / Docling JSON 必须经 blob 仓储写入，source meta 必须经 source 仓储 create/update 提交；fast skip、PDF SHA skip、staged PDF/Docling 恢复、按财期区分的默认下载窗口、`download --rebuild` 本地重建和 overwrite ticker 级清理都要用文件系统仓储 fixture 验证
+  - `tests/fins/test_cn_download_runtime.py` 负责守住 `DefaultFinsRuntime -> CnPipeline -> CN download workflow` 的 direct operation 装配边界：必须注入 fake discovery 与 fake Docling，不能让 runtime 级单测访问真实巨潮接口
+  - `tests/fins/test_cn_pipeline.py` 负责守住 `CnPipeline` 的 CN/HK download wrapper 装配边界：CN/HK workflow 测试必须注入 fake discovery 与 fake Docling，默认 HK client 类型只做无网络装配断言，不能在 pipeline 单测里访问真实披露易
   - `tests/fins/test_fins_tools_service.py` 与 `tests/fins/test_fins_tools_service_helpers_coverage.py` 共同守住消费侧 fiscal 边界：`list_documents()` 不得再仅凭 `report_date` 为 10-Q 回填季度，也不得为其他 source 文档回填空的 `fiscal_year`；当前只允许保留表单内生且不依赖日期猜测的低风险回退（如 `10-K/20-F -> FY`）
   - `tests/fins/test_fins_runtime_tool_service.py` 还要守住 `FinsToolService` 的构造期实例不变量：runtime 返回的真实 service 必须在 `__init__` 中声明实例级缓存（如 `_meta_cache`），不能把属性存在性延后到读路径里的 `hasattr` 懒初始化
   - `tests/fins/test_virtual_section_table_assignment.py` 负责守住 `_VirtualSectionProcessorMixin` 的稳定边界：虚拟章节表格映射要保持同源重分配，未启用虚拟章节时 `list_sections/read_section/list_tables/get_section_title/search` 也必须原样透传到底层 processor，而不是靠 `type: ignore[misc]` 放任下一跳协议漂移
@@ -119,6 +124,7 @@ pip install -r requirements.txt
 - `tests/application/test_console_output.py` 负责守住 CLI / WeChat / render 入口的标准流容错边界：在非 UTF-8 终端里打印中文 help 或错误文案时不得因 `UnicodeEncodeError` 崩溃。
 - `tests/cli/test_init_command.py` 还要守住 `dayu-cli init` 的交互输入边界：测试不得隐式依赖开发机已有的 `SEC_USER_AGENT` 等环境变量短路交互流程，凡是验证完整 `run_init_command()` 路径的用例，都应显式 `delenv/setenv` 相关变量并提供完整输入序列；`--reset` 这类破坏性开关还必须验证二次确认语义，且直接回车默认按 `N` 取消。
 - `tests/cli/test_init_command.py` 还要守住已有 workspace 的增量补齐语义：未传 `--overwrite` 时，`init` 只能补齐缺失的 `config/prompts/**` 资产，不能覆盖用户本地已经改过的 manifest、scene 或其他配置文件。
+- `tests/cli/workspace_migrations/` 负责守住 `dayu-cli init` 启动期的一次性 schema 迁移：`run.json` lane 新 key 只能补缺省值，必须保留用户已有取值；Host SQLite 与 transcript 类迁移必须幂等、fail-fast，不能在请求期补救。
 - `tests/application/test_cancellation_bridge.py` 与 `tests/engine/test_async_openai_runner_utils.py` 这类并发/超时测试，不得把 0.08s、0.2s 这类固定 sleep 当成必然成立的完成信号；应使用带超时的轮询等待来守住语义，避免 CI runner 时序抖动造成伪失败。
 - `tests/fins/test_storage_batch_recovery.py` 这类跨进程锁测试同样不得把 5 秒级硬编码收口时间当成必然成立的环境保证；应使用具名超时常量和轮询等待，让较慢的 Windows runner 仍能验证同一套锁语义，而不是把时序抖动误报成存储回归。
 - `test_web_routes.py` 还要守住 Web 的客户端错误语义：像 `PromptService.submit()`、`ChatService.resume_pending_turn()` 这类已经在 Service 边界同步抛出的 `ValueError/KeyError`，router 必须映射成对应 `4xx`，且 `/api/chat/resume` 只能在 resume 成功后才创建后台消费任务，不能漏成 `500` 或先受理后失败。
@@ -377,7 +383,7 @@ Fins 相关改动时，至少同步更新：
 - `tests/fins/test_sec_rebuild_workflow.py` 负责守住 rebuild 真源边界：本地过滤条件的 form/date 收敛、以及单 filing 重建时 `document_version/source_fingerprint` 保持稳定并通过 replace-source-meta 清理历史脏字段。
 - `tests/fins/test_rejected_6k_rescue.py` 还要守住 `.rejections/` 枚举容错边界：若个别 rejected artifact 目录缺失 `meta.json` 或元数据损坏，rescue 必须跳过坏目录继续处理其它候选，不能让单个脏目录中断整批误拒救回。
 - `tests/fins/test_active_6k_retriage.py` 还要守住 active filing 枚举容错边界：若个别 active `6-K` 目录缺失 `meta.json` 或元数据损坏，retriage 必须跳过坏目录继续处理其它 active 样本，不能让单个脏目录中断整批误收剔除。
-- `tests/fins/test_pipeline_cli.py` 与 `tests/fins/test_ingestion_job_manager.py` 还要继续共同守住 `document_ids` 透传链路：CLI `process` 子命令、job manager 和 ingestion backend 必须把显式文档过滤以等价语义传到 `process_stream(...)`；允许做去空、去重和稳定排序，但不能改变过滤结果，也不能让等价请求绕过去重复用。
+- `tests/fins/test_pipeline_cli.py` 与 `tests/fins/test_ingestion_job_manager.py` 还要继续共同守住 `document_ids` 透传链路：CLI `process` 子命令、job manager 和 ingestion backend 必须把显式文档过滤以等价语义传到 `process_stream(...)`；允许做去空、去重和稳定排序，但不能改变过滤结果，也不能让等价请求绕过去重复用。上传类 CLI 测试还要守住 `--company-id` 不再作为用户参数出现，公司 ID 由 ticker 归一化真源自动生成。
 - `tests/fins/test_fins_runtime_tool_service.py` 与 `tests/fins/test_cli_formatters_coverage.py` 现在还要继续守住 direct operation 的强类型消费边界：`runtime.execute()` 的测试必须先显式收窄 `FinsResult | AsyncIterator[FinsEvent]`，formatter 测试构造 pipeline 事件时优先使用 `DownloadEventType` / `ProcessEventType` / `Upload*EventType` 枚举真源，未知事件分支才允许显式 cast 到窄类型做兜底覆盖。
 
 另外，processor/source 相关测试现在要守住两条契约：

@@ -1,4 +1,8 @@
-"""港A股管线占位实现。"""
+"""港A股财报管线实现。
+
+本模块负责 CN/HK 市场的 pipeline 装配、上传、下载与离线处理入口。下载链路
+通过 ``cn_download_workflow`` 编排，文档存取统一经 ``dayu.fins.storage`` 仓储。
+"""
 
 from __future__ import annotations
 
@@ -9,18 +13,25 @@ from typing import Any, AsyncIterator, Callable, Optional
 from dayu.contracts.cancellation import CancelledError
 from dayu.log import Log
 from dayu.engine.processors.processor_registry import ProcessorRegistry
+from dayu.fins.docling_export import PdfToDoclingJsonBytes, convert_pdf_bytes_to_docling_json_bytes
 from dayu.fins.domain.document_models import ProcessedHandle
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.downloaders.cninfo_downloader import CninfoDiscoveryClient
+from dayu.fins.downloaders.hkexnews_downloader import HkexnewsDiscoveryClient
 from dayu.fins.ingestion.pipeline_backends import PipelineIngestionBackend
 from dayu.fins.ingestion.process_events import ProcessEvent, ProcessEventType
 from dayu.fins.ingestion.service import FinsIngestionService
+from dayu.fins.pipelines.cn_download_protocols import CnReportDiscoveryClientProtocol
+from dayu.fins.pipelines.cn_download_workflow import run_cn_download_stream_impl
 from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
+    FsFilingMaintenanceRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
+    FilingMaintenanceRepositoryProtocol,
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
@@ -61,7 +72,7 @@ from .upload_progress_helpers import (
 )
 from .upload_filing_events import UploadFilingEvent, UploadFilingEventType
 from .upload_material_events import UploadMaterialEvent, UploadMaterialEventType
-from .upload_company_meta import upsert_company_meta_for_upload
+from .upload_company_meta import build_upload_company_id, upsert_company_meta_for_upload
 
 
 def _raise_if_cancelled(
@@ -88,7 +99,6 @@ class CnPipeline(PipelineProtocol):
 
     PIPELINE_NAME = "cn"
     MODULE = "FINS.CN_PIPELINE"
-    NOT_IMPLEMENTED_STATUS = "not_implemented"
 
     def __init__(
         self,
@@ -98,6 +108,10 @@ class CnPipeline(PipelineProtocol):
         source_repository: SourceDocumentRepositoryProtocol | None = None,
         processed_repository: ProcessedDocumentRepositoryProtocol | None = None,
         blob_repository: DocumentBlobRepositoryProtocol | None = None,
+        filing_maintenance_repository: FilingMaintenanceRepositoryProtocol | None = None,
+        cn_discovery_client: CnReportDiscoveryClientProtocol | None = None,
+        hk_discovery_client: CnReportDiscoveryClientProtocol | None = None,
+        convert_pdf_to_docling_json: PdfToDoclingJsonBytes | None = None,
         workspace_root: Optional[Path] = None,
     ) -> None:
         """初始化港A股管线。
@@ -108,6 +122,10 @@ class CnPipeline(PipelineProtocol):
             source_repository: 可选源文档仓储实现。
             processed_repository: 可选 processed 文档仓储实现。
             blob_repository: 可选文件对象仓储实现。
+            filing_maintenance_repository: 可选 filing 维护治理仓储实现。
+            cn_discovery_client: 可选 CN 巨潮 discovery client。
+            hk_discovery_client: 可选 HK 披露易 discovery client。
+            convert_pdf_to_docling_json: 可选 PDF 到 Docling JSON 转换函数。
             workspace_root: 工作区根目录。
         Returns:
             无。
@@ -137,6 +155,21 @@ class CnPipeline(PipelineProtocol):
             self._workspace_root,
             repository_set=repository_set,
         )
+        self._filing_maintenance_repository = (
+            filing_maintenance_repository
+            or FsFilingMaintenanceRepository(
+                self._workspace_root,
+                repository_set=repository_set,
+            )
+        )
+        self._cn_discovery_client = cn_discovery_client or CninfoDiscoveryClient()
+        self._hk_discovery_client = hk_discovery_client or HkexnewsDiscoveryClient()
+        self._convert_pdf_to_docling_json = (
+            convert_pdf_to_docling_json or convert_pdf_bytes_to_docling_json_bytes
+        )
+        self._user_agent: Optional[str] = None
+        self._sleep_seconds = 0.0
+        self._max_retries = 3
         self._upload_service = DoclingUploadService(
             source_repository=self._source_repository,
             blob_repository=self._blob_repository,
@@ -148,6 +181,72 @@ class CnPipeline(PipelineProtocol):
             f"初始化港A股管线: workspace_root={self._workspace_root}",
             module=self.MODULE,
         )
+
+    @property
+    def company_meta_repository(self) -> CompanyMetaRepositoryProtocol:
+        """返回公司元数据仓储。"""
+
+        return self._company_repository
+
+    @property
+    def source_repository(self) -> SourceDocumentRepositoryProtocol:
+        """返回 source 文档仓储。"""
+
+        return self._source_repository
+
+    @property
+    def blob_repository(self) -> DocumentBlobRepositoryProtocol:
+        """返回 blob 仓储。"""
+
+        return self._blob_repository
+
+    @property
+    def processed_repository(self) -> ProcessedDocumentRepositoryProtocol:
+        """返回 processed 仓储。"""
+
+        return self._processed_repository
+
+    @property
+    def filing_maintenance_repository(self) -> FilingMaintenanceRepositoryProtocol:
+        """返回 filing 维护仓储。"""
+
+        return self._filing_maintenance_repository
+
+    @property
+    def cn_discovery_client(self) -> CnReportDiscoveryClientProtocol:
+        """返回 CN 巨潮 discovery client。"""
+
+        return self._cn_discovery_client
+
+    @property
+    def hk_discovery_client(self) -> CnReportDiscoveryClientProtocol:
+        """返回 HK 披露易 discovery client。"""
+
+        return self._hk_discovery_client
+
+    @property
+    def convert_pdf_to_docling_json(self) -> PdfToDoclingJsonBytes:
+        """返回 PDF 到 Docling JSON 转换函数。"""
+
+        return self._convert_pdf_to_docling_json
+
+    @property
+    def user_agent(self) -> Optional[str]:
+        """返回下载 User-Agent。"""
+
+        return self._user_agent
+
+    @property
+    def sleep_seconds(self) -> float:
+        """返回下载请求间隔。"""
+
+        return self._sleep_seconds
+
+    @property
+    def max_retries(self) -> int:
+        """返回下载最大重试次数。"""
+
+        return self._max_retries
 
     @property
     def ingestion_service(self) -> FinsIngestionService:
@@ -175,7 +274,7 @@ class CnPipeline(PipelineProtocol):
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
     ) -> dict[str, Any]:
-        """执行下载入口（CN 当前未实现）。
+        """执行 CN/HK 下载同步入口。
 
         Args:
             ticker: 股票代码。
@@ -184,10 +283,10 @@ class CnPipeline(PipelineProtocol):
             end_date: 可选结束日期。
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 `meta/manifest`。
-            ticker_aliases: 可选公司 alias 列表；当前 CN download 不使用该参数。
+            ticker_aliases: 可选公司 alias 列表；写入公司级 meta 时合并。
 
         Returns:
-            未实现结果字典。
+            下载结果字典。
 
         Raises:
             无。
@@ -202,9 +301,6 @@ class CnPipeline(PipelineProtocol):
             rebuild=rebuild,
             ticker_aliases=ticker_aliases,
         )
-        if result.get("status") == self.NOT_IMPLEMENTED_STATUS:
-            result = dict(result)
-            result["message"] = "CnPipeline.download 尚未实现"
         return result
 
     async def download_stream(
@@ -228,7 +324,7 @@ class CnPipeline(PipelineProtocol):
             end_date: 可选结束日期。
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 `meta/manifest`。
-            ticker_aliases: 可选公司 alias 列表；当前 CN download 不使用该参数。
+            ticker_aliases: 可选公司 alias 列表；写入公司级 meta 时合并。
             cancel_checker: 可选取消检查函数。
 
         Yields:
@@ -262,7 +358,7 @@ class CnPipeline(PipelineProtocol):
         *,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
-        """执行流式下载（CN 当前未实现）。
+        """执行流式下载。
 
         Args:
             ticker: 股票代码。
@@ -271,43 +367,30 @@ class CnPipeline(PipelineProtocol):
             end_date: 可选结束日期。
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 `meta/manifest`。
-            ticker_aliases: 可选公司 alias 列表；当前 CN download 不使用该参数。
-            cancel_checker: 可选取消检查函数（CN 当前未使用）。
+            ticker_aliases: 可选公司 alias 列表。
+            cancel_checker: 可选取消检查函数。
 
         Yields:
-            仅产出开始与结束事件，结束事件携带未实现结果。
+            下载流程事件。
 
         Raises:
             无。
         """
 
-        result = self._build_not_implemented_result(
-            action="download",
-            message="CnPipeline.download_stream 尚未实现",
+        async for event in run_cn_download_stream_impl(
+            self,
             ticker=ticker,
             form_type=form_type,
             start_date=start_date,
             end_date=end_date,
             overwrite=overwrite,
             rebuild=rebuild,
-        )
-        del cancel_checker, ticker_aliases
-        yield DownloadEvent(
-            event_type=DownloadEventType.PIPELINE_STARTED,
-            ticker=ticker,
-            payload={
-                "form_type": form_type,
-                "start_date": start_date,
-                "end_date": end_date,
-                "overwrite": overwrite,
-                "rebuild": rebuild,
-            },
-        )
-        yield DownloadEvent(
-            event_type=DownloadEventType.PIPELINE_COMPLETED,
-            ticker=ticker,
-            payload={"result": result},
-        )
+            ticker_aliases=ticker_aliases,
+            cancel_checker=cancel_checker,
+            module=self.MODULE,
+            pipeline_name=self.PIPELINE_NAME,
+        ):
+            yield event
 
     def upload_filing(
         self,
@@ -335,8 +418,8 @@ class CnPipeline(PipelineProtocol):
             amended: 是否修订版。
             filing_date: 可选披露日期。
             report_date: 可选报告日期。
-            company_id: 公司 ID（create/update 必填）。
-            company_name: 公司名称（create/update 必填）。
+            company_id: 可选兼容字段；公司 ID 会由 ticker 归一化结果自动生成。
+            company_name: 公司名称（create/update 在公司级 meta 缺失时必填，可由 infer 补齐）。
             ticker_aliases: 可选 ticker alias 列表；用于初始化公司级 meta。
             overwrite: 是否强制覆盖。
 
@@ -393,8 +476,8 @@ class CnPipeline(PipelineProtocol):
             amended: 是否修订版。
             filing_date: 可选披露日期。
             report_date: 可选报告日期。
-            company_id: 公司 ID（create/update 必填）。
-            company_name: 公司名称（create/update 必填）。
+            company_id: 可选兼容字段；公司 ID 会由 ticker 归一化结果自动生成。
+            company_name: 公司名称（create/update 在公司级 meta 缺失时必填，可由 infer 补齐）。
             ticker_aliases: 可选 ticker alias 列表；用于初始化公司级 meta。
             overwrite: 是否强制覆盖。
 
@@ -406,6 +489,7 @@ class CnPipeline(PipelineProtocol):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
+        normalized_company_id = build_upload_company_id(normalized_ticker)
         normalized_period = normalize_cn_fiscal_period(fiscal_period)
         form_type = normalized_period
         requested_action = str(action or "").strip().lower() or None
@@ -435,7 +519,7 @@ class CnPipeline(PipelineProtocol):
                 "amended": amended,
                 "filing_date": filing_date,
                 "report_date": report_date,
-                "company_id": company_id,
+                "company_id": normalized_company_id,
                 "company_name": company_name,
                 "ticker_aliases": ticker_aliases,
                 "overwrite": overwrite,
@@ -451,7 +535,6 @@ class CnPipeline(PipelineProtocol):
                 company_name=company_name,
                 ticker_aliases=ticker_aliases,
             )
-            normalized_company_id = str(company_id or normalized_ticker).strip() or normalized_ticker
             reset_upload_target_for_overwrite(
                 source_repository=self._source_repository,
                 ticker=normalized_ticker,
@@ -500,8 +583,9 @@ class CnPipeline(PipelineProtocol):
                 amended=amended,
                 filing_date=filing_date,
                 report_date=report_date,
-                company_id=company_id,
+                company_id=normalized_company_id,
                 company_name=company_name,
+                ticker_aliases=ticker_aliases,
                 overwrite=overwrite,
                 **upload_result.payload,
                 status=_resolve_upload_status(upload_result.status),
@@ -521,12 +605,13 @@ class CnPipeline(PipelineProtocol):
                 resolved_action=resolved_action,
                 files=[str(path) for path in files],
                 fiscal_year=fiscal_year,
-                fiscal_period=fiscal_period,
+                fiscal_period=normalized_period,
                 amended=amended,
                 filing_date=filing_date,
                 report_date=report_date,
-                company_id=company_id,
+                company_id=normalized_company_id,
                 company_name=company_name,
+                ticker_aliases=ticker_aliases,
                 overwrite=overwrite,
                 document_id=document_id,
                 status="failed",
@@ -571,8 +656,8 @@ class CnPipeline(PipelineProtocol):
             fiscal_period: 可选财期；提供时参与稳定 document_id 生成。
             filing_date: 可选披露日期。
             report_date: 可选报告日期。
-            company_id: 公司 ID（create/update 必填）。
-            company_name: 公司名称（create/update 必填）。
+            company_id: 可选兼容字段；公司 ID 会由 ticker 归一化结果自动生成。
+            company_name: 公司名称（create/update 在公司级 meta 缺失时必填，可由 infer 补齐）。
             ticker_aliases: 可选 ticker alias 列表；用于初始化公司级 meta。
             overwrite: 是否强制覆盖。
 
@@ -638,8 +723,8 @@ class CnPipeline(PipelineProtocol):
             fiscal_period: 可选财期；提供时参与稳定 document_id 生成。
             filing_date: 可选披露日期。
             report_date: 可选报告日期。
-            company_id: 公司 ID（create/update 必填）。
-            company_name: 公司名称（create/update 必填）。
+            company_id: 可选兼容字段；公司 ID 会由 ticker 归一化结果自动生成。
+            company_name: 公司名称（create/update 在公司级 meta 缺失时必填，可由 infer 补齐）。
             ticker_aliases: 可选 ticker alias 列表；用于初始化公司级 meta。
             overwrite: 是否强制覆盖。
 
@@ -652,6 +737,7 @@ class CnPipeline(PipelineProtocol):
 
         file_list = files or []
         normalized_ticker = _normalize_ticker(ticker)
+        normalized_company_id = build_upload_company_id(normalized_ticker)
         normalized_fiscal_period = str(fiscal_period or "").strip().upper() or None
         stable_document_id, stable_internal_document_id = build_material_ids(
             form_type=form_type,
@@ -687,7 +773,7 @@ class CnPipeline(PipelineProtocol):
                 "fiscal_period": normalized_fiscal_period,
                 "filing_date": filing_date,
                 "report_date": report_date,
-                "company_id": company_id,
+                "company_id": normalized_company_id,
                 "company_name": company_name,
                 "ticker_aliases": ticker_aliases,
                 "overwrite": overwrite,
@@ -703,7 +789,6 @@ class CnPipeline(PipelineProtocol):
                 company_name=company_name,
                 ticker_aliases=ticker_aliases,
             )
-            normalized_company_id = str(company_id or normalized_ticker).strip() or normalized_ticker
             reset_upload_target_for_overwrite(
                 source_repository=self._source_repository,
                 ticker=normalized_ticker,
@@ -752,7 +837,7 @@ class CnPipeline(PipelineProtocol):
                 fiscal_period=normalized_fiscal_period,
                 filing_date=filing_date,
                 report_date=report_date,
-                company_id=company_id,
+                company_id=normalized_company_id,
                 company_name=company_name,
                 overwrite=overwrite,
                 **upload_result.payload,
@@ -780,7 +865,7 @@ class CnPipeline(PipelineProtocol):
                 fiscal_period=normalized_fiscal_period,
                 filing_date=filing_date,
                 report_date=report_date,
-                company_id=company_id,
+                company_id=normalized_company_id,
                 company_name=company_name,
                 overwrite=overwrite,
                 status="failed",
@@ -1216,7 +1301,7 @@ class CnPipeline(PipelineProtocol):
             cancel_checker: 可选取消检查函数，仅在同步单文档处理阶段边界生效。
 
         Returns:
-            占位结果字典。
+            单文档处理结果字典。
 
         Raises:
             RuntimeError: 执行失败时抛出。
@@ -1251,7 +1336,7 @@ class CnPipeline(PipelineProtocol):
             cancel_checker: 可选取消检查函数，仅在同步单文档处理阶段边界生效。
 
         Returns:
-            占位结果字典。
+            单材料处理结果字典。
 
         Raises:
             RuntimeError: 执行失败时抛出。
@@ -1531,7 +1616,7 @@ class CnPipeline(PipelineProtocol):
         )
 
     def _build_result(self, action: str, **payload: Any) -> dict[str, Any]:
-        """构建统一占位结果。
+        """构建统一结果。
 
         Args:
             action: 动作名称。
@@ -1550,26 +1635,6 @@ class CnPipeline(PipelineProtocol):
             "status": payload.pop("status", "placeholder"),
             **payload,
         }
-
-    def _build_not_implemented_result(self, action: str, **payload: Any) -> dict[str, Any]:
-        """构建未实现结果。
-
-        Args:
-            action: 动作名称。
-            **payload: 结果负载字段。
-
-        Returns:
-            `status=not_implemented` 的统一结果字典。
-
-        Raises:
-            无。
-        """
-
-        return self._build_result(
-            action=action,
-            status=self.NOT_IMPLEMENTED_STATUS,
-            **payload,
-        )
 
     def _safe_get_document_meta(
         self,
